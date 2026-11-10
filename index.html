@@ -775,12 +775,18 @@ const $ = id => document.getElementById(id);
 const PROXIES = [u => u, u => 'https://corsproxy.io/?url=' + encodeURIComponent(u), u => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u), u => 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(u)];
 let okProxy = 1;
 async function pfetch(u, direct = false, onTry) {
-  const order = [...new Set(direct ? [0, okProxy, 1, 2, 3] : [okProxy, 1, 2, 3])];
-  for (let k = 0; k < order.length; k++) { const i = order[k];
-    onTry && onTry(k, order.length);
-    try { const r = await fetch(PROXIES[i](u), { referrerPolicy: 'no-referrer', signal: AbortSignal.timeout(direct ? 15000 : 12000) }); if (r.ok) { if (i) okProxy = i; return r } } catch {}
-  }
-  throw new Error('sem acesso');
+  // todas as rotas em paralelo; vence a primeira que responder
+  const routes = direct ? [u => u, u => 'https://wsrv.nl/?url=' + encodeURIComponent(u) + '&n=-1', ...PROXIES.slice(1)] : PROXIES.slice(1);
+  const ctrls = routes.map(() => new AbortController());
+  const timer = setTimeout(() => ctrls.forEach(c => c.abort()), direct ? 12000 : 15000);
+  onTry && onTry(0, routes.length);
+  let failed = 0;
+  try {
+    return await Promise.any(routes.map((f, i) => fetch(f(u), { referrerPolicy: 'no-referrer', signal: ctrls[i].signal }).then(r => {
+      if (!r.ok) throw 0;
+      ctrls.forEach((c, j) => j !== i && c.abort()); return r;
+    }).catch(e => { failed++; onTry && onTry(failed, routes.length); throw e })));
+  } catch { throw new Error('sem acesso') } finally { clearTimeout(timer) }
 }
 let found = [];
 function prog(p, pct, text) { const el = $(p + '-prog'); el.hidden = pct == null; if (pct == null) return; el.querySelector('i').style.width = Math.max(3, Math.min(100, pct)) + '%'; el.querySelector('span').textContent = text; }
@@ -824,7 +830,7 @@ $('ex-form').onsubmit = async e => {
   $('ex-msg').textContent = ''; $('ex-grid').innerHTML = ''; $('ex-tools').hidden = true; found = [];
   prog('ex', 5, 'Conectando ao site…');
   try {
-    const r = await pfetch(url, false, (k, n) => prog('ex', 5 + k * 8, k ? `Tentando outra rota (${k + 1}/${n})…` : 'Conectando ao site…'));
+    const r = await pfetch(url, false, (k, n) => prog('ex', 5 + k * 8, k ? `Conectando ao site… (${n - k} rotas restantes)` : 'Conectando ao site…'));
     prog('ex', 35, 'Lendo a página…'); const finalUrl = url;
     const out = new Map();
     const sheets = collect(await r.text(), finalUrl, out);
@@ -854,9 +860,9 @@ function render() {
     img.onerror = () => { f.broken = true; loaded(); filter() };
     el.onclick = async e => {
       const a = e.target.dataset.a;
-      if (a === 'dl') return saveBlob(await getBlob(f), fname(f, 0));
+      if (a === 'dl') return busy(e.target, async () => saveBlob(await getBlob(f), fname(f, 0)));
       if (a === 'open') return window.open(f.u, '_blank');
-      if (a === 'vec') { const b = await getBlob(f); window.vecAdd(new File([b], fname(f, 0), { type: b.type || 'image/png' })); document.querySelector('#tabs [data-t=vec]').click(); return }
+      if (a === 'vec') return busy(e.target, async () => { const b = await getBlob(f); window.vecAdd(new File([b], fname(f, 0), { type: b.type || 'image/png' })); document.querySelector('#tabs [data-t=vec]').click() });
       f.sel = !f.sel; el.classList.toggle('sel', f.sel); count();
     };
     g.append(el);
@@ -870,6 +876,10 @@ function count() { const v = found.filter(visible); $('ex-count').textContent = 
 $('ex-type').onchange = filter; $('ex-min').onchange = filter;
 $('ex-all').onclick = () => { const v = found.filter(visible); const all = v.every(f => f.sel); v.forEach(f => { f.sel = !all; f.el.classList.toggle('sel', f.sel) }); count(); };
 
+async function busy(btn, fn) {
+  if (btn.disabled) return; const t = btn.textContent; btn.disabled = true; btn.textContent = '…';
+  try { await fn() } catch { btn.textContent = 'Falhou'; await new Promise(r => setTimeout(r, 1500)) } finally { btn.textContent = t; btn.disabled = false }
+}
 async function getBlob(f) { return (f.u.startsWith('data:') ? await fetch(f.u) : await pfetch(f.u, true)).blob(); }
 function fname(f, i) {
   let n = f.u.startsWith('data:') ? 'imagem' : decodeURIComponent(f.u.split(/[?#]/)[0].split('/').pop() || 'imagem');
@@ -900,10 +910,12 @@ function zip(files) {
 $('ex-zip').onclick = async () => {
   const sel = found.filter(f => f.sel && visible(f)); if (!sel.length) return alert('Selecione imagens clicando nelas.');
   const b = $('ex-zip'); const names = new Set(); const files = [];
-  for (let i = 0; i < sel.length; i++) {
-    b.textContent = `Baixando ${i + 1}/${sel.length}…`;
-    try { const data = new Uint8Array(await (await getBlob(sel[i])).arrayBuffer()); let n = fname(sel[i], 0), k = 1; while (names.has(n)) n = fname(sel[i], k++); names.add(n); files.push({ name: n, data }) } catch {}
-  }
+  let next = 0, done = 0; b.disabled = true;
+  const worker = async () => { while (next < sel.length) { const f = sel[next++];
+    try { const data = new Uint8Array(await (await getBlob(f)).arrayBuffer()); let n = fname(f, 0), k = 1; while (names.has(n)) n = fname(f, k++); names.add(n); files.push({ name: n, data }) } catch {}
+    done++; b.textContent = `Baixando ${done}/${sel.length}…`; prog('ex', 100 * done / sel.length, `Baixando imagens (${done}/${sel.length})…`) } };
+  await Promise.all(Array.from({ length: 6 }, worker)); prog('ex'); b.disabled = false;
+  if (!files.length) { b.textContent = 'Baixar selecionadas (.zip)'; return alert('Não consegui baixar nenhuma das imagens selecionadas.') }
   let host = 'imagens'; try { host = new URL($('ex-url').value.startsWith('http') ? $('ex-url').value : 'https://' + $('ex-url').value).hostname } catch {}
   saveBlob(zip(files), host + '.zip'); b.textContent = 'Baixar selecionadas (.zip)';
 };
@@ -944,7 +956,7 @@ $('lg-form').onsubmit = async e => {
   const g = $('lg-grid'); g.innerHTML = ''; $('lg-msg').textContent = '';
   prog('lg', 5, 'Conectando ao site…');
   let list;
-  try { const r = await pfetch(url, false, (k, n) => prog('lg', 5 + k * 10, k ? `Tentando outra rota (${k + 1}/${n})…` : 'Conectando ao site…'));
+  try { const r = await pfetch(url, false, (k, n) => prog('lg', 5 + k * 10, k ? `Conectando ao site… (${n - k} rotas restantes)` : 'Conectando ao site…'));
     prog('lg', 45, 'Analisando cabeçalho, ícones e metadados…'); list = findLogos(await r.text(), url) }
   catch { list = findLogos('', url); $('lg-msg').textContent = 'Não consegui ler a página; mostrando os ícones disponíveis.'; }
   let left = list.length; const tick = () => { left--; if (left <= 0) prog('lg'); else prog('lg', 60 + 40 * (list.length - left) / list.length, `Verificando candidatos (${list.length - left}/${list.length})…`) };
@@ -960,9 +972,9 @@ $('lg-form').onsubmit = async e => {
     el.onclick = async e => {
       const a = e.target.dataset.a; if (!a) return;
       let host = 'logo'; try { host = new URL(url).hostname.replace(/^www\./, '') } catch {}
-      const b = await getBlob(f); const n = `logo-${host}-${i + 1}.${f.ext === '?' ? (b.type.split('/')[1] || 'png').replace('svg+xml', 'svg').replace('x-icon','ico').replace('vnd.microsoft.icon','ico') : f.ext}`;
+      return busy(e.target, async () => { const b = await getBlob(f); const n = `logo-${host}-${i + 1}.${f.ext === '?' ? (b.type.split('/')[1] || 'png').replace('svg+xml', 'svg').replace('x-icon','ico').replace('vnd.microsoft.icon','ico') : f.ext}`;
       if (a === 'dl') saveBlob(b, n);
-      else { window.vecAdd(new File([b], n, { type: b.type || 'image/png' })); document.querySelector('#tabs [data-t=vec]').click() }
+      else { window.vecAdd(new File([b], n, { type: b.type || 'image/png' })); document.querySelector('#tabs [data-t=vec]').click() } });
     };
     g.append(el);
   });
